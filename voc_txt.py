@@ -7,12 +7,10 @@ if len(sys.argv) < 2:
     print("no directory specified, please input target directory")
     exit()
 
-root_path = sys.argv[1]
+root_path = "YOLOX/datasets/VOCdevkit/"
 
-xmlfilepath = root_path + 'VOC2007/Annotations/'
-os.mkdir(xmlfilepath)
-imagefilepath = root_path + 'VOC2007/JPEGImages/'
-os.mkdir(imagefilepath)
+xmlfilepath = 'YOLOX/datasets/VOCdevkit/VOC2007/Annotations/'
+imagefilepath = 'YOLOX/datasets/VOCdevkit/VOC2007/JPEGImages/'
 
 # Move annotations to annotations folder
 for filename in os.listdir(root_path):
@@ -34,13 +32,12 @@ if not os.path.exists(root_path):
 if not os.path.exists(txtsavepath):
     os.makedirs(txtsavepath)
 
-trainval_percent = 0.9
-train_percent = 0.8
 total_xml = os.listdir(xmlfilepath)
 num = len(total_xml)
 list = range(num)
-tv = int(num * trainval_percent)
-tr = int(tv * train_percent)
+tv = int(num * 0.9)  # 90% for trainval
+tr = int(tv * 0.8888888889)  # 80% of 90% for train
+
 trainval = random.sample(list, tv)
 train = random.sample(trainval, tr)
 
