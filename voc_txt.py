@@ -7,10 +7,12 @@ if len(sys.argv) < 2:
     print("no directory specified, please input target directory")
     exit()
 
-root_path = "YOLOX/datasets/VOCdevkit/"
+root_path = sys.argv[1]
 
-xmlfilepath = 'YOLOX/datasets/VOCdevkit/VOC2007/Annotations/'
-imagefilepath = 'YOLOX/datasets/VOCdevkit/VOC2007/JPEGImages/'
+xmlfilepath = root_path + 'VOC2007/Annotations/'
+os.mkdir(xmlfilepath)
+imagefilepath = root_path + 'VOC2007/JPEGImages/'
+os.mkdir(imagefilepath)
 
 # Move annotations to annotations folder
 for filename in os.listdir(root_path):
