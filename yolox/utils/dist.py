@@ -39,13 +39,13 @@ _LOCAL_PROCESS_GROUP = None
 
 
 def get_num_devices():
-    gpu_list = os.getenv('CUDA_VISIBLE_DEVICES', None)
-    if gpu_list is not None:
-        return len(gpu_list.split(','))
+    if torch.backends.mps.is_available():
+        return 1
     else:
-        devices_list_info = os.popen("nvidia-smi -L")
-        devices_list_info = devices_list_info.read().strip().split("\n")
-        return len(devices_list_info)
+        print("MPS não está disponível.")
+        if not torch.backends.mps.is_built():
+            print("O PyTorch atual não foi construído com o MPS ativado.")
+        return 0
 
 
 @contextmanager
