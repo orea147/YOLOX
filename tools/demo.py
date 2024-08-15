@@ -5,6 +5,9 @@
 import argparse
 import os
 import time
+import shutil
+import pandas as pd
+import numpy as np
 from loguru import logger
 
 import cv2
@@ -15,6 +18,7 @@ from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import COCO_CLASSES
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess, vis
+from yolox.utils.extra import classificar_movimento, preprocess_frame
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -28,7 +32,7 @@ def make_parser():
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
 
     parser.add_argument(
-        "--path", default="./assets/dog.jpg", help="path to images or video"
+        "--path", default="../teste/", type=str, help="directory containing videos"
     )
     parser.add_argument("--camid", type=int, default=0, help="webcam demo camera id")
     parser.add_argument(
@@ -99,15 +103,15 @@ def get_image_list(path):
 
 class Predictor(object):
     def __init__(
-        self,
-        model,
-        exp,
-        cls_names=COCO_CLASSES,
-        trt_file=None,
-        decoder=None,
-        device="cpu",
-        fp16=False,
-        legacy=False,
+            self,
+            model,
+            exp,
+            cls_names=COCO_CLASSES,
+            trt_file=None,
+            decoder=None,
+            device="cpu",
+            fp16=False,
+            legacy=False,
     ):
         self.model = model
         self.cls_names = cls_names
@@ -119,8 +123,10 @@ class Predictor(object):
         self.device = device
         self.fp16 = fp16
         self.preproc = ValTransform(legacy=legacy)
+        self.centroids = []
+        self.person_centroids = []
         if trt_file is not None:
-            from torch2trt import TRTModule
+            from torch2trt import TRTModule # type: ignore
 
             model_trt = TRTModule()
             model_trt.load_state_dict(torch.load(trt_file))
@@ -152,8 +158,6 @@ class Predictor(object):
             img = img.cuda()
             if self.fp16:
                 img = img.half()  # to FP16
-        elif self.device == "mps":
-            img = img.to(torch.device("mps"))
 
         with torch.no_grad():
             t0 = time.time()
@@ -162,16 +166,16 @@ class Predictor(object):
                 outputs = self.decoder(outputs, dtype=outputs.type())
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre,
-                self.nmsthre, class_agnostic=True
+                self.nmsthre, class_agnostic=False # True para filtrar uma classe, False para detectar multiplas classes
             )
             logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, img_info
 
-    def visual(self, output, img_info, cls_conf=0.35):
+    def visual(self, output, img_info, cls_conf=0.35, timestamp=None):
         ratio = img_info["ratio"]
         img = img_info["raw_img"]
         if output is None:
-            return img
+            return img, None, None
         output = output.cpu()
 
         bboxes = output[:, 0:4]
@@ -182,8 +186,196 @@ class Predictor(object):
         cls = output[:, 6]
         scores = output[:, 4] * output[:, 5]
 
+        df = self.make_df(bboxes, cls, timestamp, cls_conf, scores)
+        df_person = self.make_df_person(bboxes, cls, timestamp, cls_conf, scores)
+
         vis_res = vis(img, bboxes, scores, cls, cls_conf, self.cls_names)
-        return vis_res
+        return vis_res, df, df_person
+
+    def make_df(self, bboxes, cls, timestamp, cls_conf, scores):
+        for index in range(bboxes.size(0)):
+            bbox_class = self.class_name(cls, index)
+            
+            # Inicializando as variáveis
+            centroid_x = centroid_y = width = height = area = proportion_rate = None
+
+            if bbox_class in ["head", "standing", "laying"] and scores[index] > cls_conf:
+                centroid_x, centroid_y = self.centroid(bboxes[index])
+
+                if bbox_class in ["standing", "laying"]:
+                    width = self.width(bboxes[index])
+                    height = self.height(bboxes[index])
+                    area = self.area_bbox(bboxes[index])
+                    proportion_rate = self.proportion_rate(bboxes[index])
+
+                self.centroids.append((timestamp, bbox_class, centroid_x, centroid_y, width, height, area, proportion_rate))
+
+        df = pd.DataFrame(self.centroids,
+                        columns=['tempo', 'Classe', 'centroid_x', 'centroid_y', 'width', 'height', 'area', 'proportion'])
+
+        df['status'] = df['Classe'].apply(lambda x: 'standing' if x == 'standing' else ('laying' if x == 'laying' else None))
+        df['proportion'] = df['proportion'].round(2)
+        df['area'] = df['area'].round(2)
+        df['width'] = df['width'].round(2)
+        df['height'] = df['height'].round(2)
+
+        standing_df = df[df['Classe'] == 'standing'].copy()
+        laying_df = df[df['Classe'] == 'laying'].copy()
+        head_df = df[df['Classe'] == 'head'].copy()
+
+        combined_df = pd.merge(standing_df, laying_df, on='tempo', how='outer')
+        combined_df = pd.merge(combined_df, head_df, on='tempo', how='outer')
+
+        combined_df = combined_df.rename(columns={
+            'centroid_x_x': 'standing_x',
+            'centroid_y_x': 'standing_y',
+            'centroid_x_y': 'deitado_x',
+            'centroid_y_y': 'deitado_y',
+            'centroid_x': 'cabeca_x',
+            'centroid_y': 'cabeca_y',
+        })
+
+        combined_df['standing_x'] = combined_df['standing_x'].fillna(combined_df['deitado_x'])
+        combined_df['standing_y'] = combined_df['standing_y'].fillna(combined_df['deitado_y'])
+        combined_df['deitado_x'] = combined_df['deitado_x'].fillna(combined_df['standing_x'])
+        combined_df['deitado_y'] = combined_df['deitado_y'].fillna(combined_df['standing_y'])
+
+        combined_df = combined_df.dropna(subset=['standing_x', 'standing_y', 'deitado_x', 'deitado_y'])
+
+        standing_xy = [0]
+        deitado_xy = [0]
+        cabeca_xy = [0]
+
+        for i in range(1, len(combined_df)):
+            standing_ponto_atual = (combined_df['standing_x'].iloc[i], combined_df['standing_y'].iloc[i])
+            standing_ponto_anterior = (combined_df['standing_x'].iloc[i - 1], combined_df['standing_y'].iloc[i - 1])
+            standing_distancia = self.distancia_euclidiana(standing_ponto_atual, standing_ponto_anterior)
+            standing_xy.append(standing_distancia)
+
+            deitado_ponto_atual = (combined_df['deitado_x'].iloc[i], combined_df['deitado_y'].iloc[i])
+            deitado_ponto_anterior = (combined_df['deitado_x'].iloc[i - 1], combined_df['deitado_y'].iloc[i - 1])
+            deitado_distancia = self.distancia_euclidiana(deitado_ponto_atual, deitado_ponto_anterior)
+            deitado_xy.append(deitado_distancia)
+
+            cabeca_ponto_atual = (combined_df['cabeca_x'].iloc[i], combined_df['cabeca_y'].iloc[i])
+            cabeca_ponto_anterior = (combined_df['cabeca_x'].iloc[i - 1], combined_df['cabeca_y'].iloc[i - 1])
+            cabeca_distancia = self.distancia_euclidiana(cabeca_ponto_atual, cabeca_ponto_anterior)
+            cabeca_xy.append(cabeca_distancia)
+
+        combined_df['standing_xy'] = standing_xy
+        combined_df['deitado_xy'] = deitado_xy
+        combined_df['cabeca_xy'] = cabeca_xy
+
+        combined_df['corpo_xy'] = combined_df['standing_xy'].fillna(combined_df['deitado_xy'])
+        combined_df['tempo'] = combined_df['tempo'].round(decimals=2)
+        combined_df = combined_df.drop_duplicates(subset=['tempo'], keep='first')
+        combined_df['status'] = combined_df['status_x'].fillna(combined_df['status_y'])
+        combined_df['proportion'] = combined_df['proportion_x'].fillna(combined_df['proportion_y'])
+        combined_df['area'] = combined_df['area_x'].fillna(combined_df['area_y'])
+        combined_df['width'] = combined_df['width_x'].fillna(combined_df['width_y'])
+        combined_df['height'] = combined_df['height_x'].fillna(combined_df['height_y'])
+        combined_df = combined_df.drop(
+            columns=['status_x', 'status_y', 'area_x', 'area_y', 'proportion_x', 'proportion_y', 'width_x', 'width_y',
+                    'height_x', 'height_y'])
+        combined_df['corpo_xy'] = combined_df['corpo_xy'].round(2)
+        combined_df['cabeca_xy'] = combined_df['cabeca_xy'].round(2)
+
+        return combined_df
+    
+    def make_df_person(self, bboxes, cls, timestamp, cls_conf, scores):
+        for index in range(bboxes.size(0)):
+            bbox_class = self.class_name(cls, index)
+
+            # Inicializando as variáveis
+            centroid_x = centroid_y = None
+
+            if bbox_class == "person" and scores[index] > cls_conf:
+                centroid_x, centroid_y = self.centroid(bboxes[index])
+                self.person_centroids.append((timestamp, bbox_class, centroid_x, centroid_y))
+
+        df_person = pd.DataFrame(self.person_centroids,
+                                columns=['tempo', 'Classe', 'centroid_x', 'centroid_y'])
+
+        # Definir o status como "person" para todas as instâncias
+        df_person['status'] = df_person['Classe'].apply(lambda x: 'person' if x == 'person' else None)
+
+        # Arredondar os valores de centroid_x e centroid_y
+        df_person['centroid_x'] = df_person['centroid_x'].round(2)
+        df_person['centroid_y'] = df_person['centroid_y'].round(2)
+
+        df_person['tempo'] = df_person['tempo'].round(decimals=2)
+        df_person = df_person.drop_duplicates(subset=['tempo'], keep='first')
+
+        return df_person
+
+
+    def width(self, bounding_box):
+        x_min = bounding_box[0].item()
+        x_max = bounding_box[2].item()
+
+        # Largura da bouding box
+        width = x_max - x_min
+
+        return width
+
+    def height(self, bounding_box):
+        y_min = bounding_box[1].item()
+        y_max = bounding_box[3].item()
+
+        # Altura da bouding box
+        height = y_max - y_min
+
+        return height
+
+    def area_bbox(self, bounding_box):
+        x_min = bounding_box[0].item()
+        y_min = bounding_box[1].item()
+        x_max = bounding_box[2].item()
+        y_max = bounding_box[3].item()
+
+        # Tamanho da bounding box
+        box_area = (x_max - x_min) * (y_max - y_min)
+
+        return box_area
+
+    def proportion_rate(self, bounding_box):
+        x_min = bounding_box[0].item()
+        y_min = bounding_box[1].item()
+        x_max = bounding_box[2].item()
+        y_max = bounding_box[3].item()
+
+        # Tamanho da bounding box
+        box_area = (x_max - x_min) * (y_max - y_min)
+
+        # Tamanho total da tela
+
+        total_screen_area = 640 * 360
+        # total_screen_area = 1280 * 720
+        # total_screen_area = 1920 * 1080
+
+        proportion_rate = box_area / total_screen_area
+
+        return proportion_rate
+
+    def distancia_euclidiana(self, ponto1, ponto2):
+        return np.sqrt((ponto1[0] - ponto2[0]) ** 2 + (ponto1[1] - ponto2[1]) ** 2)
+
+    def centroid(self, bounding_box):
+        x_min = bounding_box[0].item()
+        y_min = bounding_box[1].item()
+        x_max = bounding_box[2].item()
+        y_max = bounding_box[3].item()
+
+        centroid_x = (x_min + x_max) / 2
+        centroid_y = (y_min + y_max) / 2
+
+        return centroid_x, centroid_y
+
+    def class_name(self, cls, index):
+        class_index = int(cls[index])
+        class_name = self.cls_names[class_index]
+
+        return class_name
 
 
 def image_demo(predictor, vis_folder, path, current_time, save_result):
@@ -208,11 +400,37 @@ def image_demo(predictor, vis_folder, path, current_time, save_result):
             break
 
 
-def imageflow_demo(predictor, vis_folder, current_time, args):
+def get_video_path(video_dir):
+
+    if os.path.isfile(video_dir):
+        return video_dir
+
+    files = os.listdir(video_dir)
+
+    video_files = [f for f in files if f.lower().endswith('.mp4')]
+
+    if video_files:
+        return os.path.join(video_dir, video_files[0])
+    else:
+        return None
+
+
+def imageflow_demo(predictor, vis_folder, current_time, args, intervalo=0.5):
+
+    video_path = get_video_path(args.path)
+    args.path = video_path
+    if video_path:
+        print(f"video utilizado: {video_path}")
+    if video_path is None:
+        print("Nenhum vídeo encontrado no diretório especificado.")
+        return
+
     cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
     width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
     height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
     fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = -1
+    save_interval = int(fps * intervalo)
     if args.save_result:
         save_folder = os.path.join(
             vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
@@ -226,20 +444,59 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         vid_writer = cv2.VideoWriter(
             save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
         )
+
+    df = pd.DataFrame()
+    df_person = pd.DataFrame()
+
     while True:
         ret_val, frame = cap.read()
         if ret_val:
-            outputs, img_info = predictor.inference(frame)
-            result_frame = predictor.visual(outputs[0], img_info, predictor.confthre)
-            if args.save_result:
-                vid_writer.write(result_frame)
-            else:
-                cv2.namedWindow("yolox", cv2.WINDOW_NORMAL)
-                cv2.imshow("yolox", result_frame)
-            ch = cv2.waitKey(1)
-            if ch == 27 or ch == ord("q") or ch == ord("Q"):
-                break
+            frame_count += 1
+            if frame_count % save_interval == 0:
+                timestamp = frame_count / fps
+                new_frame = preprocess_frame(frame)
+                outputs, img_info = predictor.inference(new_frame)
+
+                result_frame, temp_df, temp_df_person = predictor.visual(outputs[0], img_info, predictor.confthre, timestamp)
+                
+                if temp_df is not None:
+                    df = temp_df
+                if temp_df_person is not None:
+                    df_person = temp_df_person
+
+                if args.save_result:
+                    vid_writer.write(result_frame)
+                else:
+                    cv2.namedWindow("yolox", cv2.WINDOW_NORMAL)
+                    cv2.imshow("yolox", result_frame)
+                ch = cv2.waitKey(1)
+                if ch == 27 or ch == ord("q") or ch == ord("Q"):
+                    print(df)
+                    print(df_person)
+                    break
         else:
+            video_filename = os.path.basename(save_path)
+            csv_filename = os.path.splitext(video_filename)[0] + ".xlsx"
+            csv_person_filename = os.path.splitext(video_filename)[0] + "_person.xlsx"
+
+            df[['tempo', 'corpo_xy', 'width', 'height', 'area',
+                'status', 'proportion', 'cabeca_xy']].to_excel(os.path.join(save_folder, csv_filename),index=False)
+            
+            df_person[['tempo', 'status']].to_excel(os.path.join(save_folder, csv_person_filename), index=False)
+
+            classificar_movimento(save_folder, csv_filename, csv_person_filename, 8, 0.1)
+
+            cap.release()
+            vid_writer.release()
+            
+            # Deletar o resultado da inferencia
+            os.remove(os.path.join(save_folder, video_filename))
+
+            # Deletar o video utilizado
+            # os.remove(args.path)
+            destination_path = os.path.join(save_folder, video_filename)
+            shutil.copy(args.path, destination_path)
+            
             break
 
 
@@ -274,8 +531,6 @@ def main(exp, args):
         model.cuda()
         if args.fp16:
             model.half()  # to FP16
-    elif args.device == "mps":
-        model.to(torch.device("mps"))
     model.eval()
 
     if not args.trt:
