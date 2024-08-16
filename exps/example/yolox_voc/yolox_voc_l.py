@@ -12,7 +12,7 @@ class Exp(MyExp):
         self.depth = 1
         self.width = 1
         self.warmup_epochs = 1
-        self.max_epoch = 20
+        self.max_epoch = 20 # Quantidade de epochs para treinamento
 
         # ---------- transform config ------------ #
         self.mosaic_prob = 1.0
