@@ -8,11 +8,11 @@ from yolox.exp import Exp as MyExp
 class Exp(MyExp):
     def __init__(self):
         super(Exp, self).__init__()
-        self.num_classes = 20
+        self.num_classes = 8
         self.depth = 0.33
         self.width = 0.50
         self.warmup_epochs = 1
-        self.max_epoch = 20 
+        self.max_epoch = 30 # Quantidade de epochs para o treinamento
 
         # ---------- transform config ------------ #
         self.mosaic_prob = 1.0
