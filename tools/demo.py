@@ -166,7 +166,7 @@ class Predictor(object):
                 outputs = self.decoder(outputs, dtype=outputs.type())
             outputs = postprocess(
                 outputs, self.num_classes, self.confthre,
-                self.nmsthre, class_agnostic=False # True para filtrar uma classe, False para detectar multiplas classes
+                self.nmsthre, class_agnostic=True # True para filtrar uma classe, False para detectar multiplas classes
             )
             logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, img_info
